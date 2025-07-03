@@ -1,20 +1,12 @@
-use cli_clipboard;
 use std::thread;
 use tray_icon::{
     TrayIconBuilder,
     menu::{Menu, MenuId, MenuItem, PredefinedMenuItem},
 };
 
-// Assuming your tailscale module is still present
-use crate::tailscale::Tailscale;
-mod tailscale;
+use crate::docker::Docker;
 
-#[derive(Clone, Debug)]
-pub struct MachineData {
-    pub ip: String,
-    pub hostname: String,
-    pub online: bool,
-}
+mod docker;
 
 const TOGGLE_ID: &str = "toggle";
 const QUIT_ID: &str = "quit";
@@ -29,14 +21,13 @@ enum AppMessage {
     Toggle,
     Refresh,
     Quit,
-    CopyIp(String),
 }
 
 /// Runs the entire tray application logic within the GTK event loop.
 fn run_tray_app() {
     gtk::init().unwrap();
 
-    const ICON_BYTES: &[u8] = include_bytes!("../imgs/tailscale-32x32.png");
+    const ICON_BYTES: &[u8] = include_bytes!("../imgs/docker.png");
     let icon = load_icon_from_bytes(ICON_BYTES);
 
     let (tx, rx) = std::sync::mpsc::channel::<AppMessage>();
@@ -58,10 +49,8 @@ fn run_tray_app() {
             AppMessage::Toggle
         } else if event_id == &refresh_id {
             AppMessage::Refresh
-        } else if event_id == &quit_id {
-            AppMessage::Quit
         } else {
-            AppMessage::CopyIp(event_id.0.clone())
+            AppMessage::Quit
         };
 
         tx.send(msg).unwrap();
@@ -80,16 +69,9 @@ fn run_tray_app() {
                     tray_icon.set_menu(Some(Box::new(rebuild_menu())));
                 }
                 AppMessage::Toggle => {
-                    let _ = Tailscale::toggle();
+                    let _ = Docker::toggle();
                     // We are on the main thread, so we can safely call `set_menu`.
                     tray_icon.set_menu(Some(Box::new(rebuild_menu())));
-                }
-                AppMessage::CopyIp(ip) => {
-                    if cli_clipboard::set_contents(ip.clone()).is_ok() {
-                        println!("Copied IP {} to clipboard!", ip);
-                    } else {
-                        eprintln!("Failed to copy IP {} to clipboard.", ip);
-                    }
                 }
                 AppMessage::Quit => {
                     println!("Quitting...");
@@ -108,10 +90,16 @@ fn run_tray_app() {
 /// Rebuilds the menu based on current state.
 fn rebuild_menu() -> Menu {
     let menu = Menu::new();
-    let is_enabled = Tailscale::is_enabled().unwrap_or(false);
-    let (toggle_item, refresh_item, quit_item) = build_control_items(is_enabled);
 
-    if is_enabled {
+    // First, determine the current state of the Docker daemon.
+    let is_active = Docker::is_active().unwrap_or(false);
+
+    // Create the primary control items (Start/Stop, Refresh, Quit).
+    let (toggle_item, refresh_item, quit_item) = build_control_items(is_active);
+
+    if is_active {
+        // --- Docker is ACTIVE ---
+        // Add the main controls first.
         menu.append_items(&[
             &toggle_item,
             &refresh_item,
@@ -119,35 +107,89 @@ fn rebuild_menu() -> Menu {
         ])
         .unwrap();
 
-        let machines = Tailscale::status().unwrap_or_else(|_| vec![]);
-        for machine in machines {
-            let icon = if machine.online { "🟢" } else { "⚫" };
-            let text = format!("{} {} ({})", icon, machine.hostname, machine.ip);
-            let id = MenuId::new(machine.ip.clone());
-            let machine_item = MenuItem::with_id(id, text, true, None);
+        // Try to get the detailed status. If it fails, we'll just show a generic message.
+        match Docker::status() {
+            Ok(status) => {
+                // Display the detailed status info as un-clickable menu items.
+                let status_header = MenuItem::new(
+                    format!("Status: {}", status.active_state),
+                    false, // Disabled
+                    None,
+                );
+                menu.append(&status_header).unwrap();
 
-            menu.append(&machine_item).unwrap();
+                if let Some(pid) = status.main_pid {
+                    let pid_item = MenuItem::new(
+                        format!("PID: {}", pid),
+                        false, // Disabled
+                        None,
+                    );
+                    menu.append(&pid_item).unwrap();
+                }
+                if let Some(mem) = status.memory_peak {
+                    let mem_item = MenuItem::new(
+                        format!("Memory Peak: {}", mem),
+                        false, // Disabled
+                        None,
+                    );
+                    menu.append(&mem_item).unwrap();
+                }
+            }
+            Err(_) => {
+                // Fallback if status parsing fails for some reason
+                let error_item = MenuItem::new("Could not retrieve status", false, None);
+                menu.append(&error_item).unwrap();
+            }
         }
     } else {
-        menu.append_items(&[&toggle_item, &refresh_item]).unwrap();
+        // --- Docker is INACTIVE ---
+        // The menu is much simpler. Just show a status and the button to start it.
+        let status_header = MenuItem::new("Status: Inactive", false, None);
+        menu.append_items(&[
+            &toggle_item,
+            &PredefinedMenuItem::separator(),
+            &status_header,
+            &refresh_item,
+        ])
+        .unwrap();
     }
 
+    // Finally, add the separator and the quit button to all menu variants.
     menu.append_items(&[&PredefinedMenuItem::separator(), &quit_item])
         .unwrap();
 
     menu
 }
 
-/// Helper to create control menu items.
-fn build_control_items(is_enabled: bool) -> (MenuItem, MenuItem, MenuItem) {
-    let toggle_text = if is_enabled {
-        "Turn Tailscale Off"
+/// Helper to create the main control menu items (Start/Stop, Refresh, Quit).
+fn build_control_items(is_active: bool) -> (MenuItem, MenuItem, MenuItem) {
+    let toggle_text = if is_active {
+        "Stop Docker"
     } else {
-        "Turn Tailscale On"
+        "Start Docker"
     };
-    let toggle_item = MenuItem::with_id(MenuId::new(TOGGLE_ID), toggle_text, true, None);
-    let refresh_item = MenuItem::with_id(MenuId::new(REFRESH_ID), "Refresh", true, None);
-    let quit_item = MenuItem::with_id(MenuId::new(QUIT_ID), "Quit", true, None);
+
+    let toggle_item = MenuItem::with_id(
+        MenuId::new(TOGGLE_ID),
+        toggle_text,
+        true, // Enabled
+        None,
+    );
+
+    let refresh_item = MenuItem::with_id(
+        MenuId::new(REFRESH_ID),
+        "Refresh",
+        true, // Enabled
+        None,
+    );
+
+    let quit_item = MenuItem::with_id(
+        MenuId::new(QUIT_ID),
+        "Quit Tray",
+        true, // Enabled
+        None,
+    );
+
     (toggle_item, refresh_item, quit_item)
 }
 
