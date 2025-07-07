@@ -123,7 +123,7 @@ fn rebuild_menu() -> Menu {
             menu.append(&machine_item).unwrap();
         }
     } else {
-        menu.append(&toggle_item).unwrap();
+        menu.append_items(&[&toggle_item, &refresh_item]).unwrap();
     }
 
     menu.append_items(&[&PredefinedMenuItem::separator(), &quit_item])
