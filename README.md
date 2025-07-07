@@ -22,9 +22,9 @@ cargo build --release
 
 ```bash
 sudo tailscale set --operator=$USER # use tailscale without root
-./target/release/tailslint
+./target/release/trayscale
 
 #or
-sudo cp ./target/release/tailslint /usr/local/bin/
-tailslint
+sudo cp ./target/release/trayscale /usr/local/bin/
+trayscale
 ```

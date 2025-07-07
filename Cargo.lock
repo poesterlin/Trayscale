@@ -1812,20 +1812,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tailslint"
-version = "0.1.0"
-dependencies = [
- "cli-clipboard",
- "glib 0.20.12",
- "gtk",
- "image",
- "muda",
- "serde",
- "thiserror 1.0.69",
- "tray-icon",
-]
-
-[[package]]
 name = "target-lexicon"
 version = "0.12.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1976,6 +1962,20 @@ dependencies = [
  "png",
  "thiserror 2.0.12",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "trayscale"
+version = "0.1.0"
+dependencies = [
+ "cli-clipboard",
+ "glib 0.20.12",
+ "gtk",
+ "image",
+ "muda",
+ "serde",
+ "thiserror 1.0.69",
+ "tray-icon",
 ]
 
 [[package]]
