@@ -307,6 +307,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "dockertray"
+version = "0.1.0"
+dependencies = [
+ "glib 0.20.12",
+ "gtk",
+ "image",
+ "muda",
+ "serde",
+ "thiserror 1.0.69",
+ "tray-icon",
+]
+
+[[package]]
 name = "dpi"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1608,19 +1621,6 @@ dependencies = [
  "pkg-config",
  "toml",
  "version-compare",
-]
-
-[[package]]
-name = "tailslint"
-version = "0.1.0"
-dependencies = [
- "glib 0.20.12",
- "gtk",
- "image",
- "muda",
- "serde",
- "thiserror 1.0.69",
- "tray-icon",
 ]
 
 [[package]]
