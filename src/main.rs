@@ -48,6 +48,7 @@ fn run_tray_app() {
         .build()
         .unwrap();
 
+    let tx_clone = tx.clone();
     tray_icon::menu::MenuEvent::set_event_handler(Some(move |event: muda::MenuEvent| {
         let (toggle_id, refresh_id, quit_id) = get_menu_item_ids();
         let event_id = event.id();
@@ -66,7 +67,12 @@ fn run_tray_app() {
         tx.send(msg).unwrap();
     }));
 
-    glib::source::idle_add_local(move || {
+    glib::source::timeout_add_local(std::time::Duration::from_secs(45), move || {
+        tx_clone.send(AppMessage::Refresh).unwrap();
+        glib::ControlFlow::Continue
+    });
+
+    glib::source::timeout_add_local(std::time::Duration::from_millis(200), move || {
         if let Ok(message) = rx.try_recv() {
             match message {
                 AppMessage::Refresh => {
