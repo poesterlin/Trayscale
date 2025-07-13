@@ -15,6 +15,7 @@ Checkout the `tray-version` branch for this.
 ## Building
 
 ```bash
+sudo pacman -Su xdotool
 cargo build --release
 ```
 
