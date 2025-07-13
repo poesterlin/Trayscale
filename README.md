@@ -22,10 +22,5 @@ cargo build --release
 ## Running
 
 ```bash
-sudo tailscale set --operator=$USER # use tailscale without root
-./target/release/trayscale
-
-#or
-sudo cp ./target/release/trayscale /usr/local/bin/
-trayscale
+./target/release/dockertray
 ```
