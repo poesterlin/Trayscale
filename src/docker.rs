@@ -1,4 +1,4 @@
-use std::process::Command;
+use std::process::{Command, Stdio};
 use thiserror::Error;
 
 /// Represents the parsed status of the Docker daemon.
@@ -6,7 +6,8 @@ use thiserror::Error;
 pub struct DockerStatus {
     /// The raw, multi-line output from the `systemctl status` command.
     pub raw_output: String,
-    /// The value of the "Active" field, e.g., "active (running)" or "inactive (dead)".
+    /// The value of the "Active" field, e.g., "active (running)" or
+    /// "inactive (dead)".
     pub active_state: String,
     /// A simple boolean indicating if the service is currently running.
     pub is_active: bool,
@@ -20,59 +21,37 @@ pub struct DockerStatus {
     pub cpu_time: Option<String>,
 }
 
-/// Defines the possible errors that can occur when interacting with the Docker daemon.
+/// Defines the possible errors that can occur when interacting with the Docker
+/// daemon.
 #[derive(Error, Debug)]
 pub enum DockerError {
-    #[error("Failed to execute systemctl command: {0}")]
-    CommandError(#[from] std::io::Error),
-
-    #[error("Sudo/systemctl command failed with stderr: {0}")]
-    CommandFailed(String),
-
-    #[error("Failed to parse systemctl output: {0}")]
-    ParseError(String),
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("command failed (code {code:?}): {stderr}")]
+    Failed { code: Option<i32>, stderr: String },
 }
 
 /// A simple wrapper for controlling the Docker daemon via `systemctl`.
 ///
-/// This wrapper requires that the user has passwordless sudo access
-/// to the specific `systemctl start docker` and `systemctl stop docker` commands.
+/// By default, this tries pkexec (GUI auth) and falls back to sudo (TTY) for
+/// start/stop.
 pub struct Docker;
 
 impl Docker {
-    /// Starts the Docker daemon by running `sudo systemctl start docker`.
-    ///
-    /// # Prerequisites
-    /// Requires passwordless `sudo` access configured in `/etc/sudoers`.
+    const SYSTEMCTL: &'static str = "/bin/systemctl"; // adjust if needed
+    const SERVICE: &'static str = "docker";
+
+    /// Starts the Docker daemon by running `systemctl start docker` as root.
     pub fn start() -> Result<(), DockerError> {
-        let output = Command::new("sudo")
-            .args(["systemctl", "start", "docker"])
-            .output()?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            return Err(DockerError::CommandFailed(stderr));
-        }
-        Ok(())
+        Self::run_as_root(Self::SYSTEMCTL, &["start", Self::SERVICE])
     }
 
-    /// Stops the Docker daemon by running `sudo systemctl stop docker`.
-    ///
-    /// # Prerequisites
-    /// Requires passwordless `sudo` access configured in `/etc/sudoers`.
+    /// Stops the Docker daemon by running `systemctl stop docker` as root.
     pub fn stop() -> Result<(), DockerError> {
-        let output = Command::new("sudo")
-            .args(["systemctl", "stop", "docker"])
-            .output()?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            return Err(DockerError::CommandFailed(stderr));
-        }
-        Ok(())
+        Self::run_as_root(Self::SYSTEMCTL, &["stop", Self::SERVICE])
     }
 
-    /// Toggles the Docker daemon's state. Starts it if it's inactive, stops it if it's active.
+    /// Toggles the Docker daemon's state. Starts if inactive, stops if active.
     pub fn toggle() -> Result<(), DockerError> {
         if Self::is_active()? {
             Self::stop()
@@ -81,13 +60,12 @@ impl Docker {
         }
     }
 
-    /// Gets the detailed status of the Docker daemon by running `systemctl status docker`.
-    /// This command does not require `sudo`.
+    /// Gets the detailed status of the Docker daemon by running
+    /// `systemctl status docker`. This does not require root.
     pub fn status() -> Result<DockerStatus, DockerError> {
-        // `systemctl status` returns a non-zero exit code when the service is inactive.
-        // We must capture the output regardless of the exit code.
-        let output = Command::new("systemctl")
-            .args(["status", "docker"])
+        // `systemctl status` returns non-zero when inactive; still parse output.
+        let output = Command::new(Self::SYSTEMCTL)
+            .args(["status", Self::SERVICE, "--no-pager"])
             .output()?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -100,7 +78,8 @@ impl Docker {
             let trimmed = line.trim();
             if let Some(value) = Self::parse_line_value(trimmed, "Active:") {
                 status.active_state = value.to_string();
-                status.is_active = status.active_state.contains("(running)");
+                // More robust: check for "active (running)" specifically
+                status.is_active = value.contains("active (running)");
             } else if let Some(value) = Self::parse_line_value(trimmed, "Loaded:") {
                 status.loaded_state = value.to_string();
             } else if let Some(value) = Self::parse_line_value(trimmed, "Main PID:") {
@@ -121,8 +100,29 @@ impl Docker {
         Ok(status.is_active)
     }
 
-    /// Helper function to parse a "Key: Value" line.
+    /// Helper: parse a "Key: Value" line.
     fn parse_line_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
         line.strip_prefix(key).map(|v| v.trim())
+    }
+
+    /// Run a command as root, preferring pkexec (GUI) and falling back to sudo.
+    fn run_as_root(cmd: &str, args: &[&str]) -> Result<(), DockerError> {
+        // GUI dialog via pkexec
+        let out = Command::new("pkexec")
+            .arg(cmd)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::piped())
+            .output();
+
+        match out {
+            Ok(o) if o.status.success() => Ok(()),
+            Ok(o) => Err(DockerError::Failed {
+                code: o.status.code(),
+                stderr: String::from_utf8_lossy(&o.stderr).to_string(),
+            }),
+            Err(e) => Err(DockerError::Io(e)),
+        }
     }
 }

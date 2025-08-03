@@ -34,7 +34,7 @@ fn run_tray_app() {
 
     let tray_icon = TrayIconBuilder::new()
         .with_menu(Box::new(rebuild_menu()))
-        .with_tooltip("Tailscale Control")
+        .with_tooltip("Docker Control")
         .with_icon(icon)
         .build()
         .unwrap();
