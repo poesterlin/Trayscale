@@ -6,11 +6,12 @@ pub struct MachineData {
     pub ip: String,
     pub hostname: String,
     pub online: bool,
+    pub is_exit_node: bool,
+    pub advertises_exit_node: bool,
     user: String,
     os: String,
     details: String,
 }
-
 
 /// Defines the possible errors that can occur when interacting with the Tailscale CLI.
 #[derive(Error, Debug)]
@@ -55,12 +56,28 @@ impl Tailscale {
         Ok(())
     }
 
+    pub fn deselect_exit_node() -> Result<(), TailscaleError> {
+        Self::set_exit_node("")
+    }
+
     pub fn toggle() -> Result<(), TailscaleError> {
         if Tailscale::is_enabled().unwrap_or(false) {
             Tailscale::down()
         } else {
             Tailscale::up()
         }
+    }
+
+    pub fn set_exit_node(hostname: &str) -> Result<(), TailscaleError> {
+        let arg = format!("--exit-node={}", hostname);
+        let output = Command::new("tailscale").arg("set").arg(arg).output()?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            return Err(TailscaleError::CommandFailed(stderr));
+        }
+
+        Ok(())
     }
 
     /// Gets the status of all machines in the network by running `tailscale status`.
@@ -94,6 +111,8 @@ impl Tailscale {
                 user: parts[2].into(),
                 os: parts[3].into(),
                 online: !details.contains("offline"),
+                is_exit_node: details.contains("exit node") && !details.contains("offers exit node"),
+                advertises_exit_node: details.contains("exit node"),
                 details: details.into(),
             };
 

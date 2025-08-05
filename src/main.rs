@@ -1,4 +1,5 @@
 use cli_clipboard;
+use muda::Submenu;
 use std::thread;
 use tray_icon::{
     TrayIconBuilder,
@@ -19,6 +20,7 @@ pub struct MachineData {
 const TOGGLE_ID: &str = "toggle";
 const QUIT_ID: &str = "quit";
 const REFRESH_ID: &str = "refresh";
+const DESELECT_EXIT_NODE_ID: &str = "deselect_exit_node";
 
 fn main() {
     let handle = thread::spawn(run_tray_app);
@@ -29,6 +31,8 @@ enum AppMessage {
     Toggle,
     Refresh,
     Quit,
+    DeselectExitNode,
+    SetExitNode(String),
     CopyIp(String),
 }
 
@@ -58,10 +62,18 @@ fn run_tray_app() {
             AppMessage::Toggle
         } else if event_id == &refresh_id {
             AppMessage::Refresh
+        } else if event_id.0 == DESELECT_EXIT_NODE_ID {
+            AppMessage::DeselectExitNode
         } else if event_id == &quit_id {
             AppMessage::Quit
+        } else if event_id.0.starts_with("copy-") {
+            let ip = event_id.0.replace("copy-", "");
+            AppMessage::CopyIp(ip)
+        } else if event_id.0.starts_with("set-exit-node-") {
+            let hostname = event_id.0.replace("set-exit-node-", "");
+            AppMessage::SetExitNode(hostname)
         } else {
-            AppMessage::CopyIp(event_id.0.clone())
+            return;
         };
 
         tx.send(msg).unwrap();
@@ -90,6 +102,14 @@ fn run_tray_app() {
                     } else {
                         eprintln!("Failed to copy IP {} to clipboard.", ip);
                     }
+                }
+                AppMessage::DeselectExitNode => {
+                    let _ = Tailscale::deselect_exit_node();
+                    tray_icon.set_menu(Some(Box::new(rebuild_menu())));
+                }
+                AppMessage::SetExitNode(hostname) => {
+                    let _ = Tailscale::set_exit_node(&hostname);
+                    tray_icon.set_menu(Some(Box::new(rebuild_menu())));
                 }
                 AppMessage::Quit => {
                     println!("Quitting...");
@@ -120,14 +140,43 @@ fn rebuild_menu() -> Menu {
         .unwrap();
 
         let machines = Tailscale::status().unwrap_or_else(|_| vec![]);
-        for machine in machines {
-            let icon = if machine.online { "🟢" } else { "⚫" };
-            let text = format!("{} {} ({})", icon, machine.hostname, machine.ip);
-            let id = MenuId::new(machine.ip.clone());
-            let machine_item = MenuItem::with_id(id, text, true, None);
-
-            menu.append(&machine_item).unwrap();
+        if machines.iter().any(|m| m.is_exit_node) {
+            let deselect_item = MenuItem::with_id(
+                MenuId::new(DESELECT_EXIT_NODE_ID),
+                "Deselect Exit Node",
+                true,
+                None,
+            );
+            menu.append(&deselect_item).unwrap();
+            menu.append(&PredefinedMenuItem::separator()).unwrap();
         }
+
+        let submenu = Submenu::new("Set Exit Node", true);
+
+        for machine in machines {
+            let icon = if machine.is_exit_node {
+                "🔽"
+            // } else if machine.online && machine.advertises_exit_node {
+            //     "🚀"
+            } else if machine.online {
+                "🟢"
+            } else {
+                "⚫"
+            };
+            let text = format!("{} {} ({})", icon, machine.hostname, machine.ip);
+            let id = MenuId::new(format!("copy-{}", machine.ip.clone()));
+            let item = MenuItem::with_id(id, text, true, None);
+            menu.append(&item).unwrap();
+
+            if machine.advertises_exit_node {
+                let text = format!("{}", machine.hostname);
+                let id = MenuId::new(format!("set-exit-node-{}", machine.hostname));
+                let exit_node_item = MenuItem::with_id(id, text, true, None);
+                submenu.append(&exit_node_item).unwrap();
+            }
+        }
+
+        menu.append(&submenu).unwrap();
     } else {
         menu.append_items(&[&toggle_item, &refresh_item]).unwrap();
     }
