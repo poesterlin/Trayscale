@@ -7,7 +7,7 @@ use tray_icon::{
 };
 
 // Assuming your tailscale module is still present
-use crate::tailscale::Tailscale;
+use crate::tailscale::{ExitNode, Tailscale};
 mod tailscale;
 
 #[derive(Clone, Debug)]
@@ -140,7 +140,17 @@ fn rebuild_menu() -> Menu {
         .unwrap();
 
         let machines = Tailscale::status().unwrap_or_else(|_| vec![]);
-        if machines.iter().any(|m| m.is_exit_node) {
+        let exit_nodes = Tailscale::get_exit_nodes().unwrap_or_else(|_| vec![]);
+
+        if machines.iter().any(|m| m.is_exit_node)
+            || exit_nodes.iter().any(|e| {
+                if let ExitNode::VPN(vpn) = e {
+                    vpn.is_exit_node
+                } else {
+                    false
+                }
+            })
+        {
             let deselect_item = MenuItem::with_id(
                 MenuId::new(DESELECT_EXIT_NODE_ID),
                 "Deselect Exit Node",
@@ -150,8 +160,6 @@ fn rebuild_menu() -> Menu {
             menu.append(&deselect_item).unwrap();
             menu.append(&PredefinedMenuItem::separator()).unwrap();
         }
-
-        let submenu = Submenu::new("Set Exit Node", true);
 
         for machine in machines {
             let icon = if machine.is_exit_node {
@@ -167,16 +175,81 @@ fn rebuild_menu() -> Menu {
             let id = MenuId::new(format!("copy-{}", machine.ip.clone()));
             let item = MenuItem::with_id(id, text, true, None);
             menu.append(&item).unwrap();
-
-            if machine.advertises_exit_node {
-                let text = format!("{}", machine.hostname);
-                let id = MenuId::new(format!("set-exit-node-{}", machine.hostname));
-                let exit_node_item = MenuItem::with_id(id, text, true, None);
-                submenu.append(&exit_node_item).unwrap();
-            }
         }
 
-        menu.append(&submenu).unwrap();
+        if !exit_nodes.is_empty() {
+            let exit_nodes_menu = Submenu::new("Exit Node", true);
+
+            let countries = exit_nodes
+                .iter()
+                .filter_map(|exit_node| match exit_node {
+                    ExitNode::VPN(vpn) => Some(vpn.country.clone()),
+                    ExitNode::Machine(_) => None,
+                })
+                .collect::<std::collections::HashSet<_>>();
+
+            let mut countries_map: std::collections::HashMap<String, Vec<MenuItem>> = countries
+                .into_iter()
+                .map(|country| (country.clone(), vec![]))
+                .collect();
+
+            for exit_node in &exit_nodes {
+                match exit_node {
+                    ExitNode::Machine(machine) => {
+                        exit_nodes_menu
+                            .append(&MenuItem::with_id(
+                                MenuId::new(format!("set-exit-node-{}", machine.hostname)),
+                                format!("{}", machine.hostname),
+                                true,
+                                None,
+                            ))
+                            .unwrap();
+                    }
+                    ExitNode::VPN(vpn) => {
+                        let id = MenuId::new(format!("set-exit-node-{}", vpn.hostname));
+                        let text = format!(
+                            "{}{} - {}",
+                            if vpn.is_exit_node { "🔽 " } else { "" },
+                            vpn.country,
+                            vpn.city
+                        );
+                        if let Some(country_submenu) = countries_map.get_mut(&vpn.country) {
+                            country_submenu.push(MenuItem::with_id(id, text, true, None));
+                        }
+                    }
+                }
+            }
+            menu.append_items(&[&PredefinedMenuItem::separator(), &exit_nodes_menu]).unwrap();
+
+            let vpn_menu = Submenu::new("VPN Exit Nodes", true);
+            let mut sorted = countries_map.iter().collect::<Vec<_>>();
+
+            sorted.sort_by(|a, b| a.0.cmp(b.0));
+
+            // Append each country submenu to the main submenu
+            for (country, items) in sorted {
+                // If there are no items for this country, skip it
+                if items.is_empty() {
+                    continue;
+                }
+
+                if items.len() == 1 {
+                    let _ = vpn_menu.append(&items[0]);
+                } else {
+                    let country_submenu = Submenu::new(country, true);
+                    for item in items {
+                        let _ = country_submenu.append(item);
+
+                        if item.text().starts_with("🔽 ") {
+                            country_submenu.set_text(format!("🔽 {}", country));
+                        }
+                    }
+                    let _ = vpn_menu.append(&country_submenu);
+                }
+            }
+
+            menu.append(&vpn_menu).unwrap();
+        }
     } else {
         menu.append_items(&[&toggle_item, &refresh_item]).unwrap();
     }

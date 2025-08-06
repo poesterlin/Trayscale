@@ -7,10 +7,23 @@ pub struct MachineData {
     pub hostname: String,
     pub online: bool,
     pub is_exit_node: bool,
-    pub advertises_exit_node: bool,
-    user: String,
-    os: String,
-    details: String,
+}
+
+pub struct ExitNodeData {
+    pub hostname: String,
+    pub ip: String,
+}
+
+pub struct VPNNodeData {
+    pub hostname: String,
+    pub country: String,
+    pub city: String,
+    pub is_exit_node: bool,
+}
+
+pub enum ExitNode {
+    VPN(VPNNodeData),
+    Machine(ExitNodeData),
 }
 
 /// Defines the possible errors that can occur when interacting with the Tailscale CLI.
@@ -21,9 +34,6 @@ pub enum TailscaleError {
 
     #[error("Tailscale command failed with stderr: {0}")]
     CommandFailed(String),
-
-    #[error("Failed to parse tailscale output: {0}")]
-    ParseError(String),
 
     #[error("Tailscale daemon is stopped.")]
     DaemonStopped, // Keep this error variant for specific status checks
@@ -104,16 +114,26 @@ impl Tailscale {
                 continue;
             }
 
+            // Skip if its a comment
+            let ip = parts[0];
+            if ip == "#" {
+                continue;
+            }
+
+            let hostname = parts[1].trim().to_string();
+            let is_vpn = hostname.ends_with("mullvad.ts.net");
+            if is_vpn {
+                // Skip VPN nodes in the status output
+                continue;
+            }
+
             let details = parts[4..].join(" ");
             let machine = MachineData {
-                ip: parts[0].into(),
+                ip: ip.into(),
                 hostname: parts[1].into(),
-                user: parts[2].into(),
-                os: parts[3].into(),
                 online: !details.contains("offline"),
-                is_exit_node: details.contains("exit node") && !details.contains("offers exit node"),
-                advertises_exit_node: details.contains("exit node"),
-                details: details.into(),
+                is_exit_node: details.contains("exit node")
+                    && !details.contains("offers exit node"),
             };
 
             if machine.online {
@@ -124,6 +144,57 @@ impl Tailscale {
         }
 
         Ok(machines)
+    }
+
+    pub fn get_exit_nodes() -> Result<Vec<ExitNode>, TailscaleError> {
+        let output = Command::new("tailscale")
+            .args(["exit-node", "list"])
+            .output()?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            return Err(TailscaleError::CommandFailed(stderr));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        let mut exit_nodes = Vec::new();
+        for line in stdout.lines().skip(2) {
+            let parts: Vec<&str> = line.split_terminator("  ").filter(|s| !s.trim().is_empty()).collect();
+
+            // A valid machine line has at least 4 parts: IP, Hostname, User, OS
+            if parts.len() < 4 {
+                continue;
+            }
+
+            // Skip if its a comment
+            let ip = parts[0];
+            if ip == "#" {
+                continue;
+            }
+
+            let hostname = parts[1].trim().to_string();
+            let is_vpn = parts[1].ends_with("mullvad.ts.net");
+
+            if is_vpn {
+                let country = parts[2].trim().to_string();
+                let city = parts[3].trim().to_string();
+                exit_nodes.push(ExitNode::VPN(VPNNodeData {
+                    hostname,
+                    country,
+                    city,
+                    is_exit_node: parts[4].contains("selected"),
+                }));
+            } else {
+                let machine = ExitNodeData {
+                    ip: ip.to_string(),
+                    hostname,
+                };
+                exit_nodes.push(ExitNode::Machine(machine));
+            }
+        }
+
+        Ok(exit_nodes)
     }
 
     /// A convenience function to get only the online machines.
