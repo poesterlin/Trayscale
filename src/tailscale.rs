@@ -1,3 +1,5 @@
+use serde::Deserialize;
+use std::collections::HashMap;
 use std::process::Command;
 use thiserror::Error;
 
@@ -9,6 +11,7 @@ pub struct MachineData {
     pub is_exit_node: bool,
 }
 
+#[derive(Clone, Debug)]
 pub struct ExitNodeData {
     pub hostname: String,
     pub ip: String,
@@ -26,6 +29,37 @@ pub enum ExitNode {
     Machine(ExitNodeData),
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct TailscaleStatus {
+    backend_state: String,
+    #[serde(default, rename = "Self")]
+    self_node: Option<PeerInfo>,
+    #[serde(default)]
+    peer: HashMap<String, PeerInfo>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct PeerInfo {
+    host_name: String,
+    #[serde(default, rename = "DNSName")]
+    dns_name: String,
+    #[serde(default)]
+    tailscale_i_ps: Vec<String>,
+    online: bool,
+    exit_node: bool,
+    exit_node_option: bool,
+    location: Option<PeerLocation>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct PeerLocation {
+    country: String,
+    city: String,
+}
+
 /// Defines the possible errors that can occur when interacting with the Tailscale CLI.
 #[derive(Error, Debug)]
 pub enum TailscaleError {
@@ -36,15 +70,36 @@ pub enum TailscaleError {
     CommandFailed(String),
 
     #[error("Tailscale daemon is stopped.")]
-    DaemonStopped, // Keep this error variant for specific status checks
+    DaemonStopped,
+
+    #[error("Failed to parse JSON: {0}")]
+    JsonError(#[from] serde_json::Error),
 }
 
 /// A simple wrapper for the Tailscale CLI.
 pub struct Tailscale;
 
+fn get_status_json() -> Result<TailscaleStatus, TailscaleError> {
+    let output = Command::new("tailscale")
+        .args(["status", "--json"])
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        if stderr.contains("Tailscale is not running")
+            || stderr.contains("Cannot connect to the Tailscale daemon")
+        {
+            return Err(TailscaleError::DaemonStopped);
+        }
+        return Err(TailscaleError::CommandFailed(stderr));
+    }
+
+    let status: TailscaleStatus = serde_json::from_slice(&output.stdout)?;
+    Ok(status)
+}
+
 impl Tailscale {
     /// Enables Tailscale by running `tailscale up`.
-    /// Requires `sudo` or running as root.
     pub fn up() -> Result<(), TailscaleError> {
         let output = Command::new("tailscale").arg("up").output()?;
 
@@ -90,50 +145,47 @@ impl Tailscale {
         Ok(())
     }
 
-    /// Gets the status of all machines in the network by running `tailscale status`.
-    pub fn status() -> Result<Vec<MachineData>, TailscaleError> {
-        let output = Command::new("tailscale").arg("status").output()?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            return Err(TailscaleError::CommandFailed(stderr));
+    /// Checks if the Tailscale daemon is currently running and enabled.
+    pub fn is_enabled() -> Result<bool, TailscaleError> {
+        match get_status_json() {
+            Ok(status) => Ok(status.backend_state == "Running"),
+            Err(TailscaleError::DaemonStopped) => Ok(false),
+            Err(e) => Err(e),
         }
+    }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
+    /// Gets this device's own node info.
+    pub fn self_node() -> Result<Option<MachineData>, TailscaleError> {
+        let status = get_status_json()?;
+        Ok(status.self_node.map(|node| MachineData {
+            ip: node.tailscale_i_ps.first().cloned().unwrap_or_default(),
+            hostname: node.host_name,
+            online: node.online,
+            is_exit_node: node.exit_node,
+        }))
+    }
 
-        if stdout.trim() == "Tailscale is stopped." {
+    /// Gets the status of all machines in the network via `tailscale status --json`.
+    pub fn status() -> Result<Vec<MachineData>, TailscaleError> {
+        let status = get_status_json()?;
+
+        if status.backend_state != "Running" {
             return Err(TailscaleError::DaemonStopped);
         }
 
         let mut machines = Vec::new();
-        for line in stdout.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-
-            // A valid machine line has at least 4 parts: IP, Hostname, User, OS
-            if parts.len() < 4 {
+        for (_key, peer) in &status.peer {
+            // Skip VPN nodes (those with a location and exit_node_option)
+            if peer.exit_node_option && peer.location.is_some() {
                 continue;
             }
 
-            // Skip if its a comment
-            let ip = parts[0];
-            if ip == "#" {
-                continue;
-            }
-
-            let hostname = parts[1].trim().to_string();
-            let is_vpn = hostname.ends_with("mullvad.ts.net");
-            if is_vpn {
-                // Skip VPN nodes in the status output
-                continue;
-            }
-
-            let details = parts[4..].join(" ");
+            let ip = peer.tailscale_i_ps.first().cloned().unwrap_or_default();
             let machine = MachineData {
-                ip: ip.into(),
-                hostname: parts[1].into(),
-                online: !details.contains("offline"),
-                is_exit_node: details.contains("exit node")
-                    && !details.contains("offers exit node"),
+                ip,
+                hostname: peer.host_name.clone(),
+                online: peer.online,
+                is_exit_node: peer.exit_node,
             };
 
             if machine.online {
@@ -146,84 +198,47 @@ impl Tailscale {
         Ok(machines)
     }
 
+    /// Gets exit nodes from `tailscale status --json`.
+    /// VPN nodes are deduplicated by country+city, keeping one representative per city.
     pub fn get_exit_nodes() -> Result<Vec<ExitNode>, TailscaleError> {
-        let output = Command::new("tailscale")
-            .args(["exit-node", "list"])
-            .output()?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            return Err(TailscaleError::CommandFailed(stderr));
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let status = get_status_json()?;
 
         let mut exit_nodes = Vec::new();
-        for line in stdout.lines().skip(2) {
-            let parts: Vec<&str> = line.split_terminator("  ").filter(|s| !s.trim().is_empty()).collect();
+        let mut seen_cities: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
 
-            // A valid machine line has at least 4 parts: IP, Hostname, User, OS
-            if parts.len() < 4 {
+        // Sort peers so active exit nodes come first (preferred when deduplicating)
+        let mut peers: Vec<&PeerInfo> = status.peer.values().collect();
+        peers.sort_by(|a, b| b.exit_node.cmp(&a.exit_node));
+
+        for peer in peers {
+            if !peer.exit_node_option {
                 continue;
             }
 
-            // Skip if its a comment
-            let ip = parts[0];
-            if ip == "#" {
-                continue;
-            }
+            let dns_name = peer.dns_name.trim_end_matches('.').to_string();
 
-            let hostname = parts[1].trim().to_string();
-            let is_vpn = parts[1].ends_with("mullvad.ts.net");
+            if let Some(location) = &peer.location {
+                let city_key = (location.country.clone(), location.city.clone());
+                if !seen_cities.insert(city_key) {
+                    continue;
+                }
 
-            if is_vpn {
-                let country = parts[2].trim().to_string();
-                let city = parts[3].trim().to_string();
                 exit_nodes.push(ExitNode::VPN(VPNNodeData {
-                    hostname,
-                    country,
-                    city,
-                    is_exit_node: parts[4].contains("selected"),
+                    hostname: dns_name,
+                    country: location.country.clone(),
+                    city: location.city.clone(),
+                    is_exit_node: peer.exit_node,
                 }));
             } else {
-                let machine = ExitNodeData {
-                    ip: ip.to_string(),
-                    hostname,
-                };
-                exit_nodes.push(ExitNode::Machine(machine));
+                let ip = peer.tailscale_i_ps.first().cloned().unwrap_or_default();
+                exit_nodes.push(ExitNode::Machine(ExitNodeData {
+                    hostname: dns_name,
+                    ip,
+                }));
             }
         }
 
         Ok(exit_nodes)
-    }
-
-    /// A convenience function to get only the online machines.
-    pub fn online_machines() -> Result<Vec<MachineData>, TailscaleError> {
-        let machines = Self::status()?;
-        let online = machines.into_iter().filter(|m| m.online).collect();
-        Ok(online)
-    }
-
-    /// Checks if the Tailscale daemon is currently running and enabled.
-    /// Returns `true` if it's running (i.e., `tailscale status` does not report "stopped"),
-    /// `false` otherwise, or an error if the command itself fails to execute.
-    pub fn is_enabled() -> Result<bool, TailscaleError> {
-        let output = Command::new("tailscale").arg("status").output()?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            // If the command failed, it's probably not enabled or there's a serious issue.
-            // Distinguish between command failure and the daemon being explicitly stopped.
-            if stderr.contains("Tailscale is not running")
-                || stderr.contains("Cannot connect to the Tailscale daemon")
-            {
-                Ok(false) // Consider it not enabled if it reports not running or connection issues
-            } else {
-                Err(TailscaleError::CommandFailed(stderr))
-            }
-        } else {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            Ok(stdout.trim() != "Tailscale is stopped.")
-        }
     }
 }

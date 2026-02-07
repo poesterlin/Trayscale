@@ -1,21 +1,14 @@
-use cli_clipboard;
+use arboard::Clipboard;
 use muda::Submenu;
+use notify_rust::Notification;
 use std::thread;
 use tray_icon::{
     TrayIconBuilder,
     menu::{Menu, MenuId, MenuItem, PredefinedMenuItem},
 };
 
-// Assuming your tailscale module is still present
 use crate::tailscale::{ExitNode, Tailscale};
 mod tailscale;
-
-#[derive(Clone, Debug)]
-pub struct MachineData {
-    pub ip: String,
-    pub hostname: String,
-    pub online: bool,
-}
 
 const TOGGLE_ID: &str = "toggle";
 const QUIT_ID: &str = "quit";
@@ -70,8 +63,8 @@ fn run_tray_app() {
             let ip = event_id.0.replace("copy-", "");
             AppMessage::CopyIp(ip)
         } else if event_id.0.starts_with("set-exit-node-") {
-            let hostname = event_id.0.replace("set-exit-node-", "");
-            AppMessage::SetExitNode(hostname)
+            let ip = event_id.0.replace("set-exit-node-", "");
+            AppMessage::SetExitNode(ip)
         } else {
             return;
         };
@@ -83,6 +76,8 @@ fn run_tray_app() {
         tx_clone.send(AppMessage::Refresh).unwrap();
         glib::ControlFlow::Continue
     });
+
+    let mut clipboard = Clipboard::new().expect("Failed to initialize clipboard");
 
     glib::source::timeout_add_local(std::time::Duration::from_millis(200), move || {
         if let Ok(message) = rx.try_recv() {
@@ -97,10 +92,14 @@ fn run_tray_app() {
                     tray_icon.set_menu(Some(Box::new(rebuild_menu())));
                 }
                 AppMessage::CopyIp(ip) => {
-                    if cli_clipboard::set_contents(ip.clone()).is_ok() {
-                        println!("Copied IP {} to clipboard!", ip);
-                    } else {
-                        eprintln!("Failed to copy IP {} to clipboard.", ip);
+                    match clipboard.set_text(&ip) {
+                        Ok(_) => {
+                            let _ = Notification::new()
+                                .summary("IP Copied")
+                                .body(&format!("{} copied to clipboard", ip))
+                                .show();
+                        }
+                        Err(e) => eprintln!("Failed to copy IP {} to clipboard: {}", ip, e),
                     }
                 }
                 AppMessage::DeselectExitNode => {
@@ -138,6 +137,14 @@ fn rebuild_menu() -> Menu {
             &PredefinedMenuItem::separator(),
         ])
         .unwrap();
+
+        if let Ok(Some(self_node)) = Tailscale::self_node() {
+            let text = format!("📌 {} ({})", self_node.hostname, self_node.ip);
+            let id = MenuId::new(format!("copy-{}", self_node.ip));
+            let item = MenuItem::with_id(id, text, true, None);
+            menu.append(&item).unwrap();
+            menu.append(&PredefinedMenuItem::separator()).unwrap();
+        }
 
         let machines = Tailscale::status().unwrap_or_else(|_| vec![]);
         let exit_nodes = Tailscale::get_exit_nodes().unwrap_or_else(|_| vec![]);
@@ -198,7 +205,7 @@ fn rebuild_menu() -> Menu {
                     ExitNode::Machine(machine) => {
                         exit_nodes_menu
                             .append(&MenuItem::with_id(
-                                MenuId::new(format!("set-exit-node-{}", machine.hostname)),
+                                MenuId::new(format!("set-exit-node-{}", machine.ip)),
                                 format!("{}", machine.hostname),
                                 true,
                                 None,
